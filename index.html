@@ -106,8 +106,17 @@ function hexToBytes(hex) {
   return bytes;
 }
 
-function parseHash(hash) {
-  const raw = hash.startsWith('#') ? hash.slice(1) : hash;
+function consumeFragment() {
+  const raw = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+  if (raw) {
+    sessionStorage.setItem('paste', raw);
+    history.replaceState(null, '', location.pathname + location.search);
+    return raw;
+  }
+  return sessionStorage.getItem('paste') || '';
+}
+
+function parseLink(raw) {
   const dotIndex = raw.indexOf('.');
   if (dotIndex === -1) throw new Error('missing dot');
   const gistId = raw.slice(0, dotIndex);
@@ -153,15 +162,15 @@ async function decryptPaste(rawText, keyBytes) {
 class MacError extends Error {}
 
 async function main() {
-  const hash = location.hash;
-  if (!hash || hash === '#') {
+  const fragment = consumeFragment();
+  if (!fragment) {
     showHelp();
     return;
   }
 
   let gistId, keyBytes;
   try {
-    ({ gistId, keyBytes } = parseHash(hash));
+    ({ gistId, keyBytes } = parseLink(fragment));
   } catch (e) {
     showError('Malformed link');
     return;
