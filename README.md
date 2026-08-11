@@ -14,7 +14,10 @@ https://iurii.net/paste/#a1b2c3d4e5f6.k9F3...q2Q_-8w
 ```
 
 The part after `#` is the URL fragment. Browsers never send it to a server, so
-only people who have the full link can decrypt the paste.
+only people who have the full link can decrypt the paste. On load the viewer
+moves the fragment from the address bar into `sessionStorage`, so the key stays
+out of browser history and injected analytics (Cloudflare adds a beacon script
+on `iurii.net`). Reload still works; to reopen later, use the link from the chat.
 
 ## Publish
 
