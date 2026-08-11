@@ -7,10 +7,10 @@ it in a browser. GitHub only ever stores ciphertext.
 A link looks like this:
 
 ```
-https://aka-rider.github.io/paste/#a1b2c3d4e5f6.k9F3...q2Q_-8w
-                                    └────┬─────┘└──────┬──────┘
-                                     gist id       base64url key
-                                                   (64 bytes: enc + mac)
+https://iurii.net/paste/#a1b2c3d4e5f6.k9F3...q2Q_-8w
+                          └────┬─────┘└──────┬──────┘
+                           gist id       base64url key
+                                         (64 bytes: enc + mac)
 ```
 
 The part after `#` is the URL fragment. Browsers never send it to a server, so
@@ -29,7 +29,7 @@ whoever needs to read the page.
 
 `pb` encrypts the file, uploads the ciphertext as a secret GitHub gist, and
 prints a link with the key in the fragment. The static viewer at
-`https://aka-rider.github.io/paste/` (GitHub Pages, `index.html` in this repo)
+`https://iurii.net/paste/` (GitHub Pages, `index.html` in this repo)
 reads the fragment, fetches the gist's raw content, verifies the HMAC, decrypts
 with WebCrypto, and renders the HTML. There is no backend and no server-side
 state.

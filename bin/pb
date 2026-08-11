@@ -53,4 +53,4 @@ fi
 
 url_key=$(xxd -r -p <<<"$key_hex" | base64 -w0 | tr '+/' '-_' | tr -d '=')
 
-echo "https://aka-rider.github.io/paste/#${gist_id}.${url_key}"
+echo "https://iurii.net/paste/#${gist_id}.${url_key}"
