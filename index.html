@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>paste</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #6b6b6b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121212;
+      --fg: #f0f0f0;
+      --muted: #9a9a9a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 1.5rem;
+  }
+  main {
+    max-width: 28rem;
+    width: 100%;
+    text-align: center;
+  }
+  .glyph {
+    font-size: 2.5rem;
+    line-height: 1;
+    margin-bottom: 0.5rem;
+  }
+  h1 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    margin: 0 0 1rem;
+    color: var(--muted);
+  }
+  #status {
+    font-size: 1rem;
+    line-height: 1.5;
+    margin: 0;
+    word-break: break-word;
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="glyph">🔒</div>
+  <h1>paste</h1>
+  <p id="status">Loading…</p>
+</main>
+<script>
+function setStatus(text) {
+  document.getElementById('status').textContent = text;
+}
+
+function showHelp() {
+  setStatus('This is a personal paste viewer. Links look like #<id>.<key>. Nothing to see without a link.');
+}
+
+function showLoading() {
+  setStatus('Decrypting…');
+}
+
+function showError(message) {
+  setStatus(message);
+}
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function base64UrlToBytes(b64url) {
+  const padLength = (4 - (b64url.length % 4)) % 4;
+  const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat(padLength);
+  return base64ToBytes(b64);
+}
+
+function hexToBytes(hex) {
+  if (hex.length === 0 || hex.length % 2 !== 0) throw new Error('invalid hex length');
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(byte)) throw new Error('invalid hex byte');
+    bytes[i] = byte;
+  }
+  return bytes;
+}
+
+function parseHash(hash) {
+  const raw = hash.startsWith('#') ? hash.slice(1) : hash;
+  const dotIndex = raw.indexOf('.');
+  if (dotIndex === -1) throw new Error('missing dot');
+  const gistId = raw.slice(0, dotIndex);
+  const keyBytes = base64UrlToBytes(raw.slice(dotIndex + 1));
+  if (keyBytes.length !== 64) throw new Error('wrong key length');
+  return { gistId, keyBytes };
+}
+
+async function fetchPasteText(gistId) {
+  let response;
+  try {
+    response = await fetch('https://gist.githubusercontent.com/aka-rider/' + gistId + '/raw', { cache: 'no-store' });
+  } catch (e) {
+    throw new NetworkError('Could not load paste. ' + e.message);
+  }
+  if (response.status === 404) throw new NotFoundError();
+  if (!response.ok) throw new NetworkError('Could not load paste. (' + response.status + ' ' + response.statusText + ')');
+  return response.text();
+}
+
+class NotFoundError extends Error {}
+class NetworkError extends Error {}
+
+async function decryptPaste(rawText, keyBytes) {
+  const cleaned = rawText.replace(/\s+/g, '');
+  const lastDot = cleaned.lastIndexOf('.');
+  if (lastDot === -1) throw new Error('missing mac separator');
+
+  const payloadBytes = base64ToBytes(cleaned.slice(0, lastDot));
+  const macBytes = hexToBytes(cleaned.slice(lastDot + 1));
+
+  const hmacKey = await crypto.subtle.importKey('raw', keyBytes.slice(32, 64), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  const macValid = await crypto.subtle.verify('HMAC', hmacKey, macBytes, payloadBytes);
+  if (!macValid) throw new MacError();
+
+  const iv = payloadBytes.slice(0, 16);
+  const ciphertext = payloadBytes.slice(16);
+  const aesKey = await crypto.subtle.importKey('raw', keyBytes.slice(0, 32), { name: 'AES-CTR' }, false, ['decrypt']);
+  const plaintextBytes = await crypto.subtle.decrypt({ name: 'AES-CTR', counter: iv, length: 128 }, aesKey, ciphertext);
+  return new TextDecoder().decode(plaintextBytes);
+}
+
+class MacError extends Error {}
+
+async function main() {
+  const hash = location.hash;
+  if (!hash || hash === '#') {
+    showHelp();
+    return;
+  }
+
+  let gistId, keyBytes;
+  try {
+    ({ gistId, keyBytes } = parseHash(hash));
+  } catch (e) {
+    showError('Malformed link');
+    return;
+  }
+
+  showLoading();
+
+  let rawText;
+  try {
+    rawText = await fetchPasteText(gistId);
+  } catch (e) {
+    if (e instanceof NotFoundError) showError('Paste not found — it may have been deleted.');
+    else showError(e.message);
+    return;
+  }
+
+  let html;
+  try {
+    html = await decryptPaste(rawText, keyBytes);
+  } catch (e) {
+    showError('Wrong key or corrupted paste.');
+    return;
+  }
+
+  document.open();
+  document.write(html);
+  document.close();
+}
+
+window.addEventListener('hashchange', main);
+main();
+</script>
+</body>
+</html>

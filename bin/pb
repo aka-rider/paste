@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+  echo "usage: pb <file.html>" >&2
+  exit 1
+fi
+
+input_file=$1
+
+if [ ! -f "$input_file" ] || [ ! -r "$input_file" ]; then
+  echo "usage: pb <file.html>" >&2
+  echo "error: '$input_file' is not a readable file" >&2
+  exit 1
+fi
+
+workdir=$(mktemp -d)
+trap 'rm -rf "$workdir"' EXIT
+
+key_hex=$(openssl rand -hex 64)
+enc_hex=${key_hex:0:64}
+mac_hex=${key_hex:64:64}
+iv_hex=$(openssl rand -hex 16)
+
+payload_file="$workdir/payload.bin"
+xxd -r -p <<<"$iv_hex" >"$payload_file"
+openssl enc -aes-256-ctr -K "$enc_hex" -iv "$iv_hex" -in "$input_file" >>"$payload_file"
+
+mac=$(openssl dgst -sha256 -mac HMAC -macopt hexkey:"$mac_hex" -r "$payload_file" | awk '{print $1}')
+
+if [ -z "$mac" ]; then
+  echo "error: failed to compute HMAC" >&2
+  exit 1
+fi
+
+payload_b64=$(base64 -w0 <"$payload_file")
+gist_content="$workdir/p.txt"
+printf '%s.%s' "$payload_b64" "$mac" >"$gist_content"
+
+content_size=$(wc -c <"$gist_content")
+if [ "$content_size" -gt $((5 * 1024 * 1024)) ]; then
+  echo "warning: encoded gist content is ${content_size} bytes (>5 MB); gist raw serving may truncate it" >&2
+fi
+
+gist_output=$(gh gist create "$gist_content" --desc paste)
+gist_id=$(basename "$gist_output" | tr -d '\r\n')
+
+if ! [[ "$gist_id" =~ ^[0-9a-f]+$ ]]; then
+  echo "error: could not extract gist id from gh output:" >&2
+  echo "$gist_output" >&2
+  exit 1
+fi
+
+url_key=$(xxd -r -p <<<"$key_hex" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+
+echo "https://aka-rider.github.io/paste/#${gist_id}.${url_key}"
