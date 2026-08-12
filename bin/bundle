@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+import base64
+import json
+import mimetypes
+import os
+import re
+import subprocess
+import sys
+from html.parser import HTMLParser
+from urllib.parse import urlsplit
+
+EXT_TYPES = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".svg": "image/svg+xml",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+}
+
+TEXTUAL_PREFIXES = ("text/",)
+TEXTUAL_TYPES = {"application/javascript", "application/json", "image/svg+xml"}
+
+URL_FUNC_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.IGNORECASE)
+
+
+class BundleError(Exception):
+    pass
+
+
+def guess_type(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in EXT_TYPES:
+        return EXT_TYPES[ext]
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or "application/octet-stream"
+
+
+def is_textual(mime_type):
+    return mime_type.startswith(TEXTUAL_PREFIXES) or mime_type in TEXTUAL_TYPES
+
+
+def is_local_reference(ref):
+    if not ref:
+        return False
+    if ref.startswith("#"):
+        return False
+    if ref.startswith("//"):
+        return False
+    parts = urlsplit(ref)
+    if parts.scheme:
+        return False
+    return True
+
+
+def strip_query_fragment(ref):
+    parts = urlsplit(ref)
+    return parts.path
+
+
+class ReferenceCollector(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stylesheets = []
+        self.scripts = []
+        self.images = []
+        self.pages = []
+
+    def handle_starttag(self, tag, attrs):
+        attr_dict = dict(attrs)
+        if tag == "link":
+            rel = attr_dict.get("rel", "")
+            rel_tokens = rel.lower().split()
+            href = attr_dict.get("href")
+            if "stylesheet" in rel_tokens and href:
+                self.stylesheets.append(href)
+        elif tag == "script":
+            src = attr_dict.get("src")
+            if src:
+                self.scripts.append(src)
+        elif tag == "img":
+            src = attr_dict.get("src")
+            if src:
+                self.images.append(src)
+            srcset = attr_dict.get("srcset")
+            if srcset:
+                self.images.extend(parse_srcset(srcset))
+        elif tag == "source":
+            src = attr_dict.get("src")
+            if src:
+                self.images.append(src)
+            srcset = attr_dict.get("srcset")
+            if srcset:
+                self.images.extend(parse_srcset(srcset))
+        elif tag == "a":
+            href = attr_dict.get("href")
+            if href:
+                self.pages.append(href)
+
+
+def parse_srcset(srcset):
+    candidates = []
+    for entry in srcset.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        url = entry.split()[0]
+        candidates.append(url)
+    return candidates
+
+
+def find_css_urls(css_text):
+    return [match.group(2) for match in URL_FUNC_RE.finditer(css_text)]
+
+
+def resolve_ref(ref, referencing_file, referencing_display):
+    clean = strip_query_fragment(ref)
+    if not clean:
+        raise BundleError(f"{referencing_display}: empty relative reference {ref!r}")
+    target = os.path.normpath(os.path.join(os.path.dirname(referencing_file), clean))
+    if not os.path.isfile(target):
+        raise BundleError(f"{referencing_display}: referenced file not found: {clean}")
+    if not os.access(target, os.R_OK):
+        raise BundleError(f"{referencing_display}: referenced file not readable: {clean}")
+    return target
+
+
+def read_bytes(path, display):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise BundleError(f"could not read {display}: {exc}")
+
+
+def decode_text(data):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def walk(entry_path):
+    visited = {}
+    queue = [os.path.realpath(entry_path)]
+    seen_real = set()
+
+    while queue:
+        real_path = queue.pop(0)
+        if real_path in seen_real:
+            continue
+        seen_real.add(real_path)
+
+        data = read_bytes(real_path, real_path)
+        mime_type = guess_type(real_path)
+        visited[real_path] = (mime_type, data)
+
+        if mime_type == "text/html":
+            text = decode_text(data)
+            if text is None:
+                raise BundleError(f"{real_path}: HTML file is not valid UTF-8")
+            collector = ReferenceCollector()
+            collector.feed(text)
+
+            for href in collector.stylesheets + collector.scripts + collector.images:
+                if not is_local_reference(href):
+                    continue
+                target = resolve_ref(href, real_path, real_path)
+                queue.append(os.path.realpath(target))
+
+            for href in collector.pages:
+                if not is_local_reference(href):
+                    continue
+                clean = strip_query_fragment(href)
+                ext = os.path.splitext(clean)[1].lower()
+                if ext not in (".html", ".htm"):
+                    continue
+                target = resolve_ref(href, real_path, real_path)
+                queue.append(os.path.realpath(target))
+
+        elif mime_type == "text/css":
+            text = decode_text(data)
+            if text is None:
+                raise BundleError(f"{real_path}: CSS file is not valid UTF-8")
+            for ref in find_css_urls(text):
+                if ref.startswith("data:"):
+                    continue
+                if not is_local_reference(ref):
+                    continue
+                target = resolve_ref(ref, real_path, real_path)
+                queue.append(os.path.realpath(target))
+
+    return visited
+
+
+def compute_root(paths):
+    if len(paths) == 1:
+        return os.path.dirname(next(iter(paths)))
+    return os.path.commonpath(list(paths))
+
+
+def find_boundary(entry_dir):
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=entry_dir,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        result = None
+    if result is not None and result.returncode == 0:
+        return os.path.realpath(result.stdout.strip())
+    return os.path.realpath(os.getcwd())
+
+
+def is_within(path, boundary):
+    path = os.path.realpath(path)
+    boundary = os.path.realpath(boundary)
+    return path == boundary or path.startswith(boundary + os.sep)
+
+
+def build_bundle(entry_arg):
+    if not os.path.isfile(entry_arg):
+        raise BundleError(f"entry file not found: {entry_arg}")
+    if not os.access(entry_arg, os.R_OK):
+        raise BundleError(f"entry file not readable: {entry_arg}")
+
+    entry_real = os.path.realpath(entry_arg)
+    entry_dir = os.path.dirname(entry_real)
+    boundary = find_boundary(entry_dir)
+
+    visited = walk(entry_arg)
+    root = compute_root(set(visited.keys()))
+
+    if not is_within(root, boundary):
+        raise BundleError(
+            f"bundle root {root} escapes boundary {boundary}"
+        )
+
+    files = {}
+    for real_path, (mime_type, data) in visited.items():
+        rel_path = os.path.relpath(real_path, root)
+        rel_path = rel_path.replace(os.sep, "/")
+        entry_obj = {"type": mime_type}
+        text = decode_text(data) if is_textual(mime_type) else None
+        if text is not None:
+            entry_obj["text"] = text
+        else:
+            entry_obj["b64"] = base64.b64encode(data).decode("ascii")
+        files[rel_path] = entry_obj
+
+    entry_rel = os.path.relpath(entry_real, root).replace(os.sep, "/")
+    return {"entry": entry_rel, "files": files}
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: bundle <entry.html>", file=sys.stderr)
+        return 1
+    try:
+        bundle = build_bundle(argv[1])
+    except BundleError as exc:
+        print(f"bundle: {exc}", file=sys.stderr)
+        return 1
+    json.dump(bundle, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

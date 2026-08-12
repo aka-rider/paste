@@ -14,8 +14,72 @@ if [ ! -f "$input_file" ] || [ ! -r "$input_file" ]; then
   exit 1
 fi
 
+self_path=$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")
+self_dir=$(dirname "$self_path")
+bundle_bin="$self_dir/bundle"
+
+if [ ! -x "$bundle_bin" ]; then
+  echo "error: bundle helper not found or not executable at '$bundle_bin'" >&2
+  exit 1
+fi
+
+resolve_viewer_base() {
+  if [ -n "${PB_VIEWER_URL:-}" ]; then
+    printf '%s' "$PB_VIEWER_URL"
+    return
+  fi
+
+  local repo_root remote owner_name html_url
+  if ! repo_root=$(git -C "$self_dir" rev-parse --show-toplevel 2>/dev/null); then
+    echo "error: '$self_dir' is not inside a git repository; set PB_VIEWER_URL to override" >&2
+    exit 1
+  fi
+
+  if ! remote=$(git -C "$repo_root" remote get-url origin 2>/dev/null); then
+    echo "error: no 'origin' remote configured in '$repo_root'; set PB_VIEWER_URL to override" >&2
+    exit 1
+  fi
+
+  owner_name=$remote
+  owner_name=${owner_name#https://github.com/}
+  owner_name=${owner_name#git@github.com:}
+  owner_name=${owner_name%.git}
+  owner_name=${owner_name%/}
+
+  if [[ ! "$owner_name" =~ ^[^/]+/[^/]+$ ]]; then
+    echo "error: could not parse owner/repo from remote '$remote'; set PB_VIEWER_URL to override" >&2
+    exit 1
+  fi
+
+  if ! html_url=$(gh api "repos/$owner_name/pages" --jq .html_url 2>/dev/null); then
+    echo "error: 'gh api repos/$owner_name/pages' failed; set PB_VIEWER_URL to override" >&2
+    exit 1
+  fi
+
+  if [ -z "$html_url" ]; then
+    echo "error: GitHub Pages API returned no html_url for '$owner_name'; set PB_VIEWER_URL to override" >&2
+    exit 1
+  fi
+
+  html_url=${html_url#http://}
+  html_url=${html_url#https://}
+  html_url=${html_url%/}
+  printf 'https://%s/' "$html_url"
+}
+
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
+
+bundle_file="$workdir/bundle.json"
+bundle_err="$workdir/bundle.err"
+set +e
+"$bundle_bin" "$input_file" >"$bundle_file" 2>"$bundle_err"
+bundle_status=$?
+set -e
+if [ "$bundle_status" -ne 0 ]; then
+  cat "$bundle_err" >&2
+  exit "$bundle_status"
+fi
 
 key_hex=$(openssl rand -hex 64)
 enc_hex=${key_hex:0:64}
@@ -24,7 +88,7 @@ iv_hex=$(openssl rand -hex 16)
 
 payload_file="$workdir/payload.bin"
 xxd -r -p <<<"$iv_hex" >"$payload_file"
-openssl enc -aes-256-ctr -K "$enc_hex" -iv "$iv_hex" -in "$input_file" >>"$payload_file"
+openssl enc -aes-256-ctr -K "$enc_hex" -iv "$iv_hex" -in "$bundle_file" >>"$payload_file"
 
 mac=$(openssl dgst -sha256 -mac HMAC -macopt hexkey:"$mac_hex" -r "$payload_file" | awk '{print $1}')
 
@@ -53,4 +117,5 @@ fi
 
 url_key=$(xxd -r -p <<<"$key_hex" | base64 -w0 | tr '+/' '-_' | tr -d '=')
 
-echo "https://iurii.net/paste/#${gist_id}.${url_key}"
+viewer_base=$(resolve_viewer_base)
+echo "${viewer_base}#${gist_id}.${url_key}"

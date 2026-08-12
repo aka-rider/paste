@@ -57,6 +57,17 @@
     margin: 0;
     word-break: break-word;
   }
+  body.paste-frame {
+    display: block;
+    padding: 0;
+  }
+  body.paste-frame iframe {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+  }
 </style>
 </head>
 <body>
@@ -95,6 +106,16 @@ function base64UrlToBytes(b64url) {
   return base64ToBytes(b64);
 }
 
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function textToBase64(text) {
+  return bytesToBase64(new TextEncoder().encode(text));
+}
+
 function hexToBytes(hex) {
   if (hex.length === 0 || hex.length % 2 !== 0) throw new Error('invalid hex length');
   const bytes = new Uint8Array(hex.length / 2);
@@ -125,20 +146,46 @@ function parseLink(raw) {
   return { gistId, keyBytes };
 }
 
+class NotFoundError extends Error {}
+class NetworkError extends Error {}
+class RateLimitError extends Error {}
+class NotAPasteError extends Error {}
+
 async function fetchPasteText(gistId) {
   let response;
   try {
-    response = await fetch('https://gist.githubusercontent.com/aka-rider/' + gistId + '/raw', { cache: 'no-store' });
+    response = await fetch('https://api.github.com/gists/' + gistId, { cache: 'no-store' });
   } catch (e) {
     throw new NetworkError('Could not load paste. ' + e.message);
   }
-  if (response.status === 404) throw new NotFoundError();
-  if (!response.ok) throw new NetworkError('Could not load paste. (' + response.status + ' ' + response.statusText + ')');
-  return response.text();
-}
 
-class NotFoundError extends Error {}
-class NetworkError extends Error {}
+  if (response.status === 404) throw new NotFoundError();
+
+  if ((response.status === 403 || response.status === 429) && response.headers.get('x-ratelimit-remaining') === '0') {
+    const resetAt = parseInt(response.headers.get('x-ratelimit-reset'), 10) * 1000;
+    const minutes = Math.max(1, Math.ceil((resetAt - Date.now()) / 60000));
+    throw new RateLimitError('GitHub API rate limit reached. Try again in ' + minutes + ' minute' + (minutes === 1 ? '' : 's') + '.');
+  }
+
+  if (!response.ok) throw new NetworkError('Could not load paste. (' + response.status + ' ' + response.statusText + ')');
+
+  const data = await response.json();
+  const file = data.files && data.files['p.txt'];
+  if (!file) throw new NotAPasteError();
+
+  if (file.truncated) {
+    let rawResponse;
+    try {
+      rawResponse = await fetch(file.raw_url, { cache: 'no-store' });
+    } catch (e) {
+      throw new NetworkError('Could not load paste. ' + e.message);
+    }
+    if (!rawResponse.ok) throw new NetworkError('Could not load paste. (' + rawResponse.status + ' ' + rawResponse.statusText + ')');
+    return rawResponse.text();
+  }
+
+  return file.content;
+}
 
 async function decryptPaste(rawText, keyBytes) {
   const cleaned = rawText.replace(/\s+/g, '');
@@ -160,6 +207,149 @@ async function decryptPaste(rawText, keyBytes) {
 }
 
 class MacError extends Error {}
+
+function posixDirname(path) {
+  const idx = path.lastIndexOf('/');
+  return idx === -1 ? '' : path.slice(0, idx);
+}
+
+function normalizePosixPath(path) {
+  const stack = [];
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') stack.pop();
+    else stack.push(part);
+  }
+  return stack.join('/');
+}
+
+function resolveBundlePath(basePath, ref) {
+  const dir = posixDirname(basePath);
+  return normalizePosixPath(dir ? dir + '/' + ref : ref);
+}
+
+function isExternalRef(ref) {
+  return ref.startsWith('#') || ref.startsWith('//') || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(ref);
+}
+
+function stripQueryAndFragment(ref) {
+  return ref.split('#')[0].split('?')[0];
+}
+
+function resolveBundleRef(basePath, ref) {
+  if (!ref || isExternalRef(ref)) return null;
+  const clean = stripQueryAndFragment(ref);
+  return clean ? resolveBundlePath(basePath, clean) : null;
+}
+
+function isBundle(parsed) {
+  return !!parsed && typeof parsed === 'object' &&
+    typeof parsed.entry === 'string' &&
+    !!parsed.files && typeof parsed.files === 'object';
+}
+
+function tryParseBundle(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+  return isBundle(parsed) ? parsed : null;
+}
+
+function assetDataUri(file) {
+  const b64 = file.b64 !== undefined ? file.b64 : textToBase64(file.text);
+  return 'data:' + file.type + ';base64,' + b64;
+}
+
+function inlineCssUrls(cssText, bundle, cssPath) {
+  return cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (match, quote, ref) => {
+    const key = resolveBundleRef(cssPath, ref);
+    const asset = key && bundle.files[key];
+    return asset ? 'url(' + assetDataUri(asset) + ')' : match;
+  });
+}
+
+function injectNavScript(doc, path, bundleKeys) {
+  const script = doc.createElement('script');
+  script.textContent = [
+    'var BASE_PATH = ' + JSON.stringify(path) + ';',
+    'var BUNDLE_KEYS = ' + JSON.stringify(bundleKeys) + ';',
+    posixDirname.toString(),
+    normalizePosixPath.toString(),
+    resolveBundlePath.toString(),
+    isExternalRef.toString(),
+    stripQueryAndFragment.toString(),
+    resolveBundleRef.toString(),
+    'document.addEventListener("click", function (event) {',
+    '  var anchor = event.target.closest("a[href]");',
+    '  if (!anchor) return;',
+    '  var target = resolveBundleRef(BASE_PATH, anchor.getAttribute("href"));',
+    '  if (!target || BUNDLE_KEYS.indexOf(target) === -1) return;',
+    '  event.preventDefault();',
+    '  parent.postMessage(target, "*");',
+    '});'
+  ].join('\n');
+  doc.body.appendChild(script);
+}
+
+function renderBundlePage(bundle, path) {
+  const file = bundle.files[path];
+  const doc = new DOMParser().parseFromString(file.text, 'text/html');
+
+  doc.querySelectorAll('link[rel~="stylesheet"][href]').forEach((link) => {
+    const key = resolveBundleRef(path, link.getAttribute('href'));
+    const cssFile = key && bundle.files[key];
+    if (!cssFile) return;
+    const style = doc.createElement('style');
+    style.textContent = inlineCssUrls(cssFile.text, bundle, key);
+    link.replaceWith(style);
+  });
+
+  doc.querySelectorAll('script[src]').forEach((script) => {
+    const key = resolveBundleRef(path, script.getAttribute('src'));
+    const jsFile = key && bundle.files[key];
+    if (!jsFile) return;
+    const inline = doc.createElement('script');
+    inline.textContent = jsFile.text;
+    script.replaceWith(inline);
+  });
+
+  doc.querySelectorAll('img[src], source[src]').forEach((el) => {
+    const key = resolveBundleRef(path, el.getAttribute('src'));
+    const asset = key && bundle.files[key];
+    if (!asset) return;
+    el.setAttribute('src', assetDataUri(asset));
+  });
+
+  injectNavScript(doc, path, Object.keys(bundle.files));
+
+  return '<!doctype html>' + doc.documentElement.outerHTML;
+}
+
+function renderPaste(plaintext) {
+  const bundle = tryParseBundle(plaintext);
+
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('sandbox', 'allow-scripts allow-popups');
+
+  document.body.innerHTML = '';
+  document.body.classList.add('paste-frame');
+  document.body.appendChild(iframe);
+
+  if (!bundle) {
+    iframe.srcdoc = plaintext;
+    return;
+  }
+
+  const bundleKeys = Object.keys(bundle.files);
+  window.addEventListener('message', (event) => {
+    if (typeof event.data !== 'string' || !bundleKeys.includes(event.data)) return;
+    iframe.srcdoc = renderBundlePage(bundle, event.data);
+  });
+  iframe.srcdoc = renderBundlePage(bundle, bundle.entry);
+}
 
 async function main() {
   const fragment = consumeFragment();
@@ -183,21 +373,24 @@ async function main() {
     rawText = await fetchPasteText(gistId);
   } catch (e) {
     if (e instanceof NotFoundError) showError('Paste not found — it may have been deleted.');
+    else if (e instanceof NotAPasteError) showError('This does not look like a paste (missing p.txt).');
     else showError(e.message);
     return;
   }
 
-  let html;
+  let plaintext;
   try {
-    html = await decryptPaste(rawText, keyBytes);
+    plaintext = await decryptPaste(rawText, keyBytes);
   } catch (e) {
     showError('Wrong key or corrupted paste.');
     return;
   }
 
-  document.open();
-  document.write(html);
-  document.close();
+  try {
+    renderPaste(plaintext);
+  } catch (e) {
+    showError('Malformed paste bundle.');
+  }
 }
 
 window.addEventListener('hashchange', main);
