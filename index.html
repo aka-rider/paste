@@ -323,6 +323,17 @@ function renderBundlePage(bundle, path) {
     el.setAttribute('src', assetDataUri(asset));
   });
 
+  doc.querySelectorAll('img[srcset], source[srcset]').forEach((el) => {
+    const rewritten = el.getAttribute('srcset').split(/\s*,\s*/).map((candidate) => {
+      const [url, ...descriptor] = candidate.split(/\s+/);
+      const key = resolveBundleRef(path, url);
+      const asset = key && bundle.files[key];
+      const resolvedUrl = asset ? assetDataUri(asset) : url;
+      return [resolvedUrl, ...descriptor].join(' ');
+    });
+    el.setAttribute('srcset', rewritten.join(', '));
+  });
+
   injectNavScript(doc, path, Object.keys(bundle.files));
 
   return '<!doctype html>' + doc.documentElement.outerHTML;
